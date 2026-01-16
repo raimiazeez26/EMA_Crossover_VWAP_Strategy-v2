@@ -45,6 +45,14 @@ def load_trades():
     return trades
 
 
+def _matches_strategy(extensions):
+    if not extensions:
+        return True
+    if extensions.get("comment") == STRATEGY_NAME:
+        return True
+    return extensions.get("tag") == STRATEGY_NAME
+
+
 def fetch_open_trades():
     token = os.getenv("OANDA_TOKEN")
     account_id = os.getenv("OANDA_ACCOUNT_ID")
@@ -77,11 +85,12 @@ def fetch_open_trades():
         )
     trades = []
     for trade in payload.get("trades", []):
-        extensions = trade.get("clientExtensions") or {}
-        if extensions.get("comment") != STRATEGY_NAME and extensions.get("tag") != STRATEGY_NAME:
+        extensions = trade.get("clientExtensions") or trade.get("tradeClientExtensions") or {}
+        if not _matches_strategy(extensions):
             continue
         trades.append(
             {
+                "id": trade.get("id"),
                 "instrument": trade.get("instrument"),
                 "currentUnits": trade.get("currentUnits"),
                 "price": trade.get("price"),
