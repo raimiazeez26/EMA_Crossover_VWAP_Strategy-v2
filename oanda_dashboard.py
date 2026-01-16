@@ -2,6 +2,7 @@ import os
 from datetime import datetime
 
 import json
+import requests
 
 import pandas as pd
 from dash import Dash, Input, Output, dcc, html, dash_table
@@ -9,6 +10,7 @@ from dash import Dash, Input, Output, dcc, html, dash_table
 
 SYMBOL_PARAMS_PATH = "backtest_outputs/symbol_params_latest.json"
 TRADE_HISTORY_PATH = "backtest_outputs/oanda_trade_history.csv"
+STRATEGY_NAME = "EMA_VWAP"
 
 
 def load_symbols():
@@ -33,15 +35,83 @@ def load_trades():
             "entry_price",
             "stop_loss",
             "take_profit",
+            "strategy",
         ])
     trades = pd.read_csv(TRADE_HISTORY_PATH)
     if not trades.empty:
         trades["timestamp"] = pd.to_datetime(trades["timestamp"], errors="coerce")
+    if "strategy" in trades.columns:
+        trades = trades[trades["strategy"] == STRATEGY_NAME]
     return trades
 
 
-def build_layout(symbols, trades):
+def _matches_strategy(extensions):
+    if not extensions:
+        return True
+    if extensions.get("comment") == STRATEGY_NAME:
+        return True
+    return extensions.get("tag") == STRATEGY_NAME
+
+
+def fetch_open_trades():
+    token = os.getenv("OANDA_TOKEN")
+    account_id = os.getenv("OANDA_ACCOUNT_ID")
+    base_url = os.getenv("OANDA_API_BASE_URL", "https://api-fxpractice.oanda.com")
+    if not token or not account_id:
+        return pd.DataFrame(
+            columns=[
+                "instrument",
+                "currentUnits",
+                "price",
+                "unrealizedPL",
+                "openTime",
+            ]
+        )
+    url = f"{base_url}/v3/accounts/{account_id}/openTrades"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    try:
+        response = requests.get(url, headers=headers, timeout=20)
+        response.raise_for_status()
+        payload = response.json()
+    except requests.RequestException:
+        return pd.DataFrame(
+            columns=[
+                "instrument",
+                "currentUnits",
+                "price",
+                "unrealizedPL",
+                "openTime",
+            ]
+        )
+    trades = []
+    for trade in payload.get("trades", []):
+        extensions = trade.get("clientExtensions") or trade.get("tradeClientExtensions") or {}
+        if not _matches_strategy(extensions):
+            continue
+        trades.append(
+            {
+                "id": trade.get("id"),
+                "instrument": trade.get("instrument"),
+                "currentUnits": trade.get("currentUnits"),
+                "price": trade.get("price"),
+                "unrealizedPL": trade.get("unrealizedPL"),
+                "openTime": trade.get("openTime"),
+            }
+        )
+    return pd.DataFrame(trades)
+
+
+def build_layout(symbols, trades, open_trades):
     symbol_items = [html.Li(symbol) for symbol in symbols] if symbols else [html.Li("No symbols loaded")]
+
+    open_trade_table = dash_table.DataTable(
+        columns=[{"name": col.replace("_", " ").title(), "id": col} for col in open_trades.columns],
+        data=open_trades.to_dict("records"),
+        page_size=10,
+        style_table={"overflowX": "auto"},
+        style_header={"backgroundColor": "#111827", "color": "white", "fontWeight": "bold"},
+        style_cell={"padding": "8px", "fontFamily": "Arial", "fontSize": "14px"},
+    )
 
     trade_table = dash_table.DataTable(
         columns=[{"name": col.replace("_", " ").title(), "id": col} for col in trades.columns],
@@ -70,6 +140,8 @@ def build_layout(symbols, trades):
                     html.Div(
                         style={"flex": "2", "background": "#f9fafb", "padding": "16px", "borderRadius": "8px"},
                         children=[
+                            html.H3("Open Trades"),
+                            open_trade_table,
                             html.H3("Trade History"),
                             trade_table,
                         ],
@@ -93,7 +165,7 @@ app.layout = html.Div(
 
 @app.callback(Output("dashboard-content", "children"), Input("refresh", "n_intervals"))
 def refresh_dashboard(_):
-    return build_layout(load_symbols(), load_trades())
+    return build_layout(load_symbols(), load_trades(), fetch_open_trades())
 
 
 if __name__ == "__main__":
