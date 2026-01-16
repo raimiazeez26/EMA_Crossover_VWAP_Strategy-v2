@@ -1,0 +1,15 @@
+{
+  "tickers": [
+    "AAPL",
+    "MSFT"
+  ],
+  "risk_percent": 1,
+  "accounts": [
+    {
+      "name": "Test Account",
+      "key": "PKB90UFVEPCKP4HK7Y5A",
+      "secret": "Zi5nlLZrtnk4qTYtHwoWES2P7iFkhXiVdamwhn7c",
+      "base_url": "https://paper-api.alpaca.markets"
+    }
+  ]
+}
