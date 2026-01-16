@@ -3,7 +3,6 @@ import logging
 import os
 import time
 from datetime import datetime
-from uuid import uuid4
 
 import numpy as np
 import pandas as pd
@@ -38,7 +37,6 @@ def record_trade(entry, path="backtest_outputs/oanda_trade_history.csv"):
         "entry_price",
         "stop_loss",
         "take_profit",
-        "strategy",
     ]
     exists = os.path.exists(path)
     with open(path, "a", encoding="utf-8") as handle:
@@ -53,14 +51,11 @@ class OandaAdvancedTradingBot:
         self.symbols = symbols
         self.risk_percent = risk_percent
         self.symbol_params = symbol_params or {}
-        self.strategy_name = "EMA_VWAP"
+        self.comment = "EMA+VWAP"
         self.active_symbols = set()
         self.last_eod_date = None
         self.last_nav = None
         self.instrument_meta = {}
-        self.order_message_map = {}
-        self.trade_message_map = {}
-        self.closed_trade_notified = set()
 
         self.oanda_token = os.getenv("OANDA_TOKEN")
         self.oanda_account_id = os.getenv("OANDA_ACCOUNT_ID")
@@ -162,20 +157,15 @@ class OandaAdvancedTradingBot:
             return timeframe_value
         return mapping.get(int(timeframe_value), "M5")
 
-    def send_telegram(self, message, reply_to_message_id=None):
+    def send_telegram(self, message):
         if not self.telegram_token or not self.telegram_chat_id:
-            return None
+            return
         url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
         payload = {"chat_id": self.telegram_chat_id, "text": message}
-        if reply_to_message_id:
-            payload["reply_to_message_id"] = reply_to_message_id
         try:
-            response = requests.post(url, data=payload, timeout=10)
-            response.raise_for_status()
-            return response.json().get("result", {}).get("message_id")
+            requests.post(url, data=payload, timeout=10)
         except requests.RequestException as exc:
             logging.warning("Telegram notification failed: %s", exc)
-        return None
 
     def fetch_data(self, symbol, granularity, count=300):
         oanda_symbol = self.normalize_symbol(symbol)
@@ -346,7 +336,6 @@ class OandaAdvancedTradingBot:
         if signal == "SELL":
             units = -units
 
-        client_extension_id = f"{self.strategy_name}-{uuid4().hex[:10]}"
         order = {
             "order": {
                 "units": str(units),
@@ -355,11 +344,7 @@ class OandaAdvancedTradingBot:
                 "type": order_type,
                 "price": _format_price(entry_price, price_precision),
                 "positionFill": "DEFAULT",
-                "clientExtensions": {
-                    "comment": self.strategy_name,
-                    "tag": self.strategy_name,
-                    "id": client_extension_id,
-                },
+                "clientExtensions": {"comment": self.comment},
                 "takeProfitOnFill": {"price": _format_price(take_profit, price_precision)},
                 "stopLossOnFill": {"price": _format_price(stop_loss, price_precision)},
             }
@@ -375,7 +360,7 @@ class OandaAdvancedTradingBot:
                 take_profit,
                 pip_size,
             )
-            response = self._request("POST", f"/v3/accounts/{self.oanda_account_id}/orders", payload=order)
+            self._request("POST", f"/v3/accounts/{self.oanda_account_id}/orders", payload=order)
             self.active_symbols.add(symbol)
             record_trade(
                 {
@@ -386,81 +371,13 @@ class OandaAdvancedTradingBot:
                     "entry_price": _format_price(entry_price, price_precision),
                     "stop_loss": _format_price(stop_loss, price_precision),
                     "take_profit": _format_price(take_profit, price_precision),
-                    "strategy": self.strategy_name,
                 }
             )
-            message = "\n".join(
-                [
-                    f"Signal: {self.strategy_name} ({signal})",
-                    f"Symbol: {oanda_symbol}",
-                    f"Order Type: {order_type}",
-                    f"Units: {units}",
-                    f"Entry: {_format_price(entry_price, price_precision)}",
-                    f"Stop Loss: {_format_price(stop_loss, price_precision)}",
-                    f"Take Profit: {_format_price(take_profit, price_precision)}",
-                    f"Time (UTC): {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}",
-                ]
+            self.send_telegram(
+                f"{symbol} {signal} order placed. Entry {entry_price:.5f}, SL {stop_loss:.5f}, TP {take_profit:.5f}"
             )
-            message_id = self.send_telegram(message)
-            if message_id:
-                self.order_message_map[client_extension_id] = message_id
-                order_id = response.get("orderCreateTransaction", {}).get("id")
-                if order_id:
-                    self.order_message_map[order_id] = message_id
         except requests.RequestException as exc:
             logging.warning("Order placement failed for %s: %s", symbol, exc)
-
-    def sync_trade_updates(self):
-        try:
-            open_trades_payload = self._request("GET", f"/v3/accounts/{self.oanda_account_id}/openTrades")
-            closed_trades_payload = self._request(
-                "GET", f"/v3/accounts/{self.oanda_account_id}/trades", params={"state": "CLOSED"}
-            )
-        except requests.RequestException as exc:
-            logging.warning("Trade sync failed: %s", exc)
-            return
-
-        for trade in open_trades_payload.get("trades", []):
-            extensions = trade.get("clientExtensions") or {}
-            if extensions.get("comment") != self.strategy_name and extensions.get("tag") != self.strategy_name:
-                continue
-            trade_id = trade.get("id")
-            if not trade_id or trade_id in self.trade_message_map:
-                continue
-            extension_id = extensions.get("id")
-            message_id = None
-            if extension_id:
-                message_id = self.order_message_map.get(extension_id)
-            if not message_id:
-                message_id = self.order_message_map.get(trade.get("orderID"))
-            if message_id:
-                self.trade_message_map[trade_id] = message_id
-
-        for trade in closed_trades_payload.get("trades", []):
-            trade_id = trade.get("id")
-            if not trade_id or trade_id in self.closed_trade_notified:
-                continue
-            extensions = trade.get("clientExtensions") or {}
-            if extensions.get("comment") != self.strategy_name and extensions.get("tag") != self.strategy_name:
-                continue
-            realized_pl = float(trade.get("realizedPL", 0))
-            outcome = "WIN" if realized_pl >= 0 else "LOSS"
-            message = "\n".join(
-                [
-                    f"Exit: {self.strategy_name}",
-                    f"Symbol: {trade.get('instrument')}",
-                    f"Units: {trade.get('currentUnits')}",
-                    f"Open Time: {trade.get('openTime')}",
-                    f"Close Time: {trade.get('closeTime')}",
-                    f"Entry: {trade.get('price')}",
-                    f"Exit Price: {trade.get('closePrice')}",
-                    f"PnL: {realized_pl:.2f}",
-                    f"Result: {outcome}",
-                ]
-            )
-            reply_to = self.trade_message_map.get(trade_id)
-            self.send_telegram(message, reply_to_message_id=reply_to)
-            self.closed_trade_notified.add(trade_id)
 
     def sync_existing_positions(self):
         logging.info("Syncing existing positions")
@@ -503,7 +420,6 @@ class OandaAdvancedTradingBot:
                         signal, latest = self.generate_signal(symbol)
                         if signal in {"BUY", "SELL"}:
                             self.place_order(symbol, signal, latest)
-                    self.sync_trade_updates()
                     self.send_eod_pnl()
                     logging.info("Cycle complete; sleeping 60s")
                     time.sleep(60)
