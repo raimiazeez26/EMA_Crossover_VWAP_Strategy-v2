@@ -4,7 +4,9 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="4e2b97f7-0eab-4560-9a6b-cf8a58e9d6d0" name="Changes" comment="initial commit for deployment" />
+    <list default="true" id="4e2b97f7-0eab-4560-9a6b-cf8a58e9d6d0" name="Changes" comment="initial commit for deployment">
+      <change beforePath="$PROJECT_DIR$/requirements.txt" beforeDir="false" afterPath="$PROJECT_DIR$/requirements.txt" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -13,6 +15,18 @@
   <component name="Git.Settings">
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
   </component>
+  <component name="GitHubPullRequestSearchHistory"><![CDATA[{
+  "lastFilter": {
+    "state": "OPEN",
+    "assignee": "raimiazeez26"
+  }
+}]]></component>
+  <component name="GithubPullRequestsUISettings"><![CDATA[{
+  "selectedUrlAndAccountId": {
+    "url": "https://github.com/raimiazeez26/EMA_Crossover_VWAP_Strategy-v2.git",
+    "accountId": "254a0ceb-5b12-4fce-97c7-a3505eba853c"
+  }
+}]]></component>
   <component name="ProjectColorInfo">{
   &quot;associatedIndex&quot;: 7
 }</component>
@@ -22,15 +36,16 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent">{
-  &quot;keyToString&quot;: {
-    &quot;Python.mt5_optimize.executor&quot;: &quot;Run&quot;,
-    &quot;Python.oanda_dashboard.executor&quot;: &quot;Run&quot;,
-    &quot;Python.trading_mt5.executor&quot;: &quot;Run&quot;,
-    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
-    &quot;last_opened_file_path&quot;: &quot;C:/Users/USER/Documents/PythonScripts/Upwork/Python Developer for Forex Trading Bots Strategy 2 - Kelvin Cheung&quot;
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "Python.mt5_optimize.executor": "Run",
+    "Python.oanda_dashboard.executor": "Run",
+    "Python.trading_mt5.executor": "Run",
+    "RunOnceActivity.ShowReadmeOnStart": "true",
+    "git-widget-placeholder": "master",
+    "last_opened_file_path": "C:/Users/USER/Documents/PythonScripts/EMA_Crossover_VWAP_Strategy-codex-create-backtest-and-optimization-scripts-for-trading-ail09d"
   }
-}</component>
+}]]></component>
   <component name="RunManager" selected="Python.oanda_dashboard">
     <configuration name="mt5_optimize" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
       <module name="EMA Crossover + VWAP strategy" />
@@ -130,7 +145,15 @@
       <option name="project" value="LOCAL" />
       <updated>1768549124327</updated>
     </task>
-    <option name="localTasksCounter" value="2" />
+    <task id="LOCAL-00002" summary="initial commit for deployment">
+      <option name="closed" value="true" />
+      <created>1768550103686</created>
+      <option name="number" value="00002" />
+      <option name="presentableId" value="LOCAL-00002" />
+      <option name="project" value="LOCAL" />
+      <updated>1768550103686</updated>
+    </task>
+    <option name="localTasksCounter" value="3" />
     <servers />
   </component>
   <component name="VcsManagerConfiguration">

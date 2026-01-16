@@ -1,2 +1,2 @@
 web: gunicorn oanda_dashboard:server
-worker: python oanta_trading_fixed.py
+worker: python oanda_trading_fixed.py
