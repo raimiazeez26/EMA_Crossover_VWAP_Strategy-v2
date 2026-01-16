@@ -62,6 +62,8 @@ class OandaAdvancedTradingBot:
         self.order_message_map = {}
         self.trade_message_map = {}
         self.closed_trade_notified = set()
+        self.closed_order_notified = set()
+        self.pending_orders = {}
 
         self.oanda_token = os.getenv("OANDA_TOKEN")
         self.oanda_account_id = os.getenv("OANDA_ACCOUNT_ID")
@@ -209,6 +211,112 @@ class OandaAdvancedTradingBot:
             return None
 
         return {"bid": bid, "ask": ask, "instrument": oanda_symbol}
+
+    def _order_extensions_match(self, extensions):
+        if not extensions:
+            return False
+        if extensions.get("comment") == self.strategy_name:
+            return True
+        return extensions.get("tag") == self.strategy_name
+
+    def _should_cancel_order(self, order, pricing):
+        if not pricing:
+            return False
+        try:
+            entry_price = float(order.get("price"))
+            stop_price = float(order.get("stopLossOnFill", {}).get("price"))
+        except (TypeError, ValueError):
+            return False
+        if entry_price == stop_price:
+            return False
+        distance = abs(entry_price - stop_price)
+        if distance <= 0:
+            return False
+        direction = order.get("units")
+        if direction is None:
+            return False
+        try:
+            units = float(direction)
+        except (TypeError, ValueError):
+            return False
+        if units > 0:
+            threshold = entry_price - 0.5 * distance
+            return pricing["bid"] <= threshold
+        threshold = entry_price + 0.5 * distance
+        return pricing["ask"] >= threshold
+
+    def _cancel_order(self, order_id):
+        return self._request("PUT", f"/v3/accounts/{self.oanda_account_id}/orders/{order_id}/cancel")
+
+    def sync_order_updates(self):
+        try:
+            orders_payload = self._request("GET", f"/v3/accounts/{self.oanda_account_id}/pendingOrders")
+        except requests.RequestException as exc:
+            logging.warning("Pending order sync failed: %s", exc)
+            return
+
+        current_orders = {}
+        for order in orders_payload.get("orders", []):
+            extensions = order.get("clientExtensions") or order.get("orderClientExtensions") or {}
+            if not self._order_extensions_match(extensions):
+                continue
+            order_id = order.get("id")
+            if not order_id:
+                continue
+            current_orders[order_id] = order
+
+        for order_id, order in current_orders.items():
+            pricing = self.fetch_pricing(order.get("instrument"))
+            if not pricing:
+                continue
+            if self._should_cancel_order(order, pricing):
+                try:
+                    self._cancel_order(order_id)
+                    message = "\n".join(
+                        [
+                            f"Order canceled: {self.strategy_name}",
+                            f"Symbol: {order.get('instrument')}",
+                            f"Order ID: {order_id}",
+                            f"Reason: price moved 50% against entry",
+                            f"Entry: {order.get('price')}",
+                            f"Stop Loss: {order.get('stopLossOnFill', {}).get('price')}",
+                            f"Time (UTC): {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}",
+                        ]
+                    )
+                    reply_to = self.order_message_map.get(order_id)
+                    self.send_telegram(message, reply_to_message_id=reply_to)
+                    self.closed_order_notified.add(order_id)
+                except requests.RequestException as exc:
+                    logging.warning("Failed to cancel order %s: %s", order_id, exc)
+
+        missing_orders = set(self.pending_orders) - set(current_orders)
+        for order_id in missing_orders:
+            if order_id in self.closed_order_notified:
+                continue
+            try:
+                order_payload = self._request(
+                    "GET", f"/v3/accounts/{self.oanda_account_id}/orders/{order_id}"
+                )
+            except requests.RequestException as exc:
+                logging.warning("Failed to fetch order %s details: %s", order_id, exc)
+                continue
+            order = order_payload.get("order", {})
+            state = order.get("state", "UNKNOWN")
+            if str(state).upper() == "CANCELLED":
+                message = "\n".join(
+                    [
+                        f"Order canceled: {self.strategy_name}",
+                        f"Order ID: {order_id}",
+                        f"Symbol: {order.get('instrument')}",
+                        f"State: {state}",
+                        f"Time (UTC): {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}",
+                    ]
+                )
+                reply_to = self.order_message_map.get(order_id)
+                self.send_telegram(message, reply_to_message_id=reply_to)
+                self.closed_order_notified.add(order_id)
+
+        self.pending_orders = current_orders
 
     def send_keepalive(self):
         if not self.keepalive_url:
@@ -572,8 +680,12 @@ class OandaAdvancedTradingBot:
             return
 
         for trade in open_trades_payload.get("trades", []):
-            extensions = trade.get("clientExtensions") or {}
-            if extensions.get("comment") != self.strategy_name and extensions.get("tag") != self.strategy_name:
+            extensions = (
+                trade.get("clientExtensions")
+                or trade.get("tradeClientExtensions")
+                or {}
+            )
+            if not self._order_extensions_match(extensions):
                 continue
             trade_id = trade.get("id")
             if not trade_id or trade_id in self.trade_message_map:
@@ -591,8 +703,12 @@ class OandaAdvancedTradingBot:
             trade_id = trade.get("id")
             if not trade_id or trade_id in self.closed_trade_notified:
                 continue
-            extensions = trade.get("clientExtensions") or {}
-            if extensions.get("comment") != self.strategy_name and extensions.get("tag") != self.strategy_name:
+            extensions = (
+                trade.get("clientExtensions")
+                or trade.get("tradeClientExtensions")
+                or {}
+            )
+            if trade_id not in self.trade_message_map and not self._order_extensions_match(extensions):
                 continue
             realized_pl = float(trade.get("realizedPL", 0))
             outcome = "WIN" if realized_pl >= 0 else "LOSS"
@@ -669,6 +785,7 @@ class OandaAdvancedTradingBot:
                         signal, latest = self.generate_signal(symbol)
                         if signal in {"BUY", "SELL"}:
                             self.place_order(symbol, signal, latest)
+                    self.sync_order_updates()
                     self.sync_trade_updates()
                     self.send_eod_pnl()
                     self.send_keepalive()
