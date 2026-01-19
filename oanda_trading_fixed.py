@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import time
+import warnings
 from datetime import datetime
 from uuid import uuid4
 
@@ -18,6 +19,7 @@ logging.basicConfig(
 )
 
 load_dotenv()
+warnings.filterwarnings("ignore")
 
 
 def _to_decimal(value):
