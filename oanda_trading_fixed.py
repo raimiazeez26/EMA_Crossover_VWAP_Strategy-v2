@@ -143,6 +143,30 @@ class OandaAdvancedTradingBot:
             return 2
         return 5
 
+    def get_quote_to_usd_rate(self, symbol, price_hint=None):
+        normalized = self.normalize_symbol(symbol)
+        if "_" not in normalized:
+            return 1.0
+        _, quote = normalized.split("_", maxsplit=1)
+        if quote == "USD":
+            return 1.0
+        if normalized.startswith("USD_"):
+            if price_hint:
+                return 1 / float(price_hint)
+            pricing = self.fetch_pricing(normalized)
+            if pricing:
+                return 1 / float(pricing["bid"])
+        pair_usd_quote = f"USD_{quote}"
+        pricing = self.fetch_pricing(pair_usd_quote)
+        if pricing:
+            return 1 / float(pricing["bid"])
+        pair_quote_usd = f"{quote}_USD"
+        pricing = self.fetch_pricing(pair_quote_usd)
+        if pricing:
+            return float(pricing["bid"])
+        logging.warning("Conversion rate unavailable for quote %s; assuming USD.", quote)
+        return 1.0
+
     def is_fx_pair(self, symbol):
         normalized = self.normalize_symbol(symbol)
         if "_" not in normalized:
@@ -524,12 +548,15 @@ class OandaAdvancedTradingBot:
             return "SELL", latest_m5
         return "NEUTRAL", latest_m5
 
-    def calculate_position_size(self, entry_price, stop_loss):
+    def calculate_position_size(self, entry_price, stop_loss, symbol=None):
         logging.info("Calculating position size")
         account = self._request("GET", f"/v3/accounts/{self.oanda_account_id}")
         balance = float(account["account"]["balance"])
         risk_amount = balance * (self.risk_percent / 100)
         risk_per_unit = abs(entry_price - stop_loss)
+        if symbol and self.is_fx_pair(symbol):
+            quote_to_usd = self.get_quote_to_usd_rate(symbol, price_hint=entry_price)
+            risk_per_unit *= quote_to_usd
         if risk_per_unit <= 0:
             return 0
         return max(int(risk_amount / risk_per_unit), 1)
@@ -589,7 +616,7 @@ class OandaAdvancedTradingBot:
             rr_ratio=float(rr_ratio),
         )
 
-        units = self.calculate_position_size(entry_price, stop_loss)
+        units = self.calculate_position_size(entry_price, stop_loss, symbol=symbol)
         if units <= 0:
             return
         if signal == "SELL":
