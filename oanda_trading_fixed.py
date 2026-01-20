@@ -489,17 +489,23 @@ class OandaAdvancedTradingBot:
         if oanda_symbol in self.active_symbols:
             return True
         try:
-            logging.info("Checking existing positions for %s", symbol)
-            positions = self._request("GET", f"/v3/accounts/{self.oanda_account_id}/openPositions")
+            logging.info("Checking existing EMA_VWAP trades for %s", symbol)
+            trades = self._request("GET", f"/v3/accounts/{self.oanda_account_id}/openTrades")
             orders = self._request("GET", f"/v3/accounts/{self.oanda_account_id}/pendingOrders")
         except requests.RequestException as exc:
-            logging.warning("Position lookup failed: %s", exc)
+            logging.warning("Trade lookup failed: %s", exc)
             return False
-        for position in positions.get("positions", []):
-            if position.get("instrument") == oanda_symbol:
+        for trade in trades.get("trades", []):
+            if trade.get("instrument") != oanda_symbol:
+                continue
+            extensions = trade.get("clientExtensions") or trade.get("tradeClientExtensions") or {}
+            if self._order_extensions_match(extensions):
                 return True
         for order in orders.get("orders", []):
-            if order.get("instrument") == oanda_symbol:
+            if order.get("instrument") != oanda_symbol:
+                continue
+            extensions = order.get("clientExtensions") or order.get("orderClientExtensions") or {}
+            if self._order_extensions_match(extensions):
                 return True
         return False
 
@@ -521,8 +527,8 @@ class OandaAdvancedTradingBot:
             logging.warning("Insufficient indicator data for %s", symbol)
             return "NEUTRAL", None
 
-        latest_h1 = h1_df.iloc[-2]
-        latest_m5 = m5_df.iloc[-2]
+        latest_h1 = h1_df.iloc[-1]
+        latest_m5 = m5_df.iloc[-1]
 
         bearish_trend = latest_h1["EMA21"] > latest_h1["EMA13"] > latest_h1["EMA8"]
         bullish_trend = latest_h1["EMA21"] < latest_h1["EMA13"] < latest_h1["EMA8"]
@@ -565,7 +571,7 @@ class OandaAdvancedTradingBot:
 
     def place_order(self, symbol, signal, latest):
         if self.has_existing_trade(symbol):
-            logging.info("Existing trade found for %s, skipping new order", symbol)
+            logging.info("Existing EMA_VWAP trade found for %s, skipping new order", symbol)
             return
         if latest is None:
             return
@@ -576,29 +582,17 @@ class OandaAdvancedTradingBot:
         pip_buffer = params.get("pip_buffer", 3)
         atr_value = latest["ATR"]
         oanda_symbol = self.normalize_symbol(symbol)
+        price_precision = self.get_price_precision(symbol)
         pip_size = self.get_pip_size(symbol)
         raw_distance = pip_buffer * pip_size
         distance = self._min_entry_distance_abs(symbol, raw_distance)
 
-        price_precision = self.get_price_precision(symbol)
-
-        # Use live bid/ask for STOP placement (metals spreads can be wide vs mid candle close)
-        pricing = self.fetch_pricing(symbol)
-        if not pricing:
-            logging.warning("No live pricing for %s; skipping order placement", oanda_symbol)
-            return
-
-        bid = pricing["bid"]
-        ask = pricing["ask"]
-
         if signal == "BUY":
-            # BUY STOP must be above current ask
-            entry_price = ask + distance
+            entry_price = latest["swing_high"] + distance
             stop_loss = latest["swing_low"] - (atr_value * atr_multiplier)
             order_type = "STOP"
         else:
-            # SELL STOP must be below current bid
-            entry_price = bid - distance
+            entry_price = latest["swing_low"] - distance
             stop_loss = latest["swing_high"] + (atr_value * atr_multiplier)
             order_type = "STOP"
 
@@ -760,8 +754,15 @@ class OandaAdvancedTradingBot:
 
     def sync_existing_positions(self):
         logging.info("Syncing existing positions")
-        positions = self._request("GET", f"/v3/accounts/{self.oanda_account_id}/openPositions")
-        self.active_symbols = {pos.get("instrument") for pos in positions.get("positions", []) if pos.get("instrument")}
+        trades_payload = self._request("GET", f"/v3/accounts/{self.oanda_account_id}/openTrades")
+        self.active_symbols = {
+            trade.get("instrument")
+            for trade in trades_payload.get("trades", [])
+            if trade.get("instrument")
+            and self._order_extensions_match(
+                trade.get("clientExtensions") or trade.get("tradeClientExtensions") or {}
+            )
+        }
         if self.active_symbols:
             logging.info("Synced existing positions for %s symbols", len(self.active_symbols))
 
