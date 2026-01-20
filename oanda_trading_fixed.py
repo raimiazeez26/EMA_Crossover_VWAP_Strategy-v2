@@ -779,12 +779,13 @@ class OandaAdvancedTradingBot:
             self.last_eod_date = today
             return
         pnl = nav - self.last_nav
-        message = f"EOD PnL for {today}: {pnl:.2f}. NAV: {nav:.2f}"
+        pnl_percent = (pnl / self.last_nav) * 100 if self.last_nav else 0.0
+        message = f"EOD PnL for {today}: {pnl:.2f} ({pnl_percent:.2f}%). NAV: {nav:.2f}"
         self.send_telegram(message)
         logging.info(message)
         if now.weekday() == 4 and self.last_weekly_update_date != today:
             weekly_message = (
-                f"Weekly update (Friday) {today}: EOD PnL {pnl:.2f}. NAV: {nav:.2f}"
+                f"Weekly update (Friday) {today}: EOD PnL {pnl:.2f} ({pnl_percent:.2f}%). NAV: {nav:.2f}"
             )
             self.send_telegram(weekly_message)
             logging.info(weekly_message)

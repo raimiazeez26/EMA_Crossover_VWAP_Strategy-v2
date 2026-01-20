@@ -5,7 +5,7 @@ import json
 import requests
 
 import pandas as pd
-from dash import Dash, Input, Output, dcc, html, dash_table
+from dash import Dash, Input, Output, State, dcc, html, dash_table, no_update
 
 
 SYMBOL_PARAMS_PATH = "backtest_outputs/symbol_params_latest.json"
@@ -100,6 +100,21 @@ def fetch_open_trades():
         )
     return pd.DataFrame(trades)
 
+def close_trade(trade_id):
+    token = os.getenv("OANDA_TOKEN")
+    account_id = os.getenv("OANDA_ACCOUNT_ID")
+    base_url = os.getenv("OANDA_API_BASE_URL", "https://api-fxpractice.oanda.com")
+    if not token or not account_id:
+        return False, "Missing OANDA credentials."
+    url = f"{base_url}/v3/accounts/{account_id}/trades/{trade_id}/close"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    try:
+        response = requests.put(url, headers=headers, timeout=20)
+        response.raise_for_status()
+        return True, f"Closed trade {trade_id}."
+    except requests.RequestException as exc:
+        return False, f"Failed to close trade {trade_id}: {exc}"
+
 
 def build_layout(symbols, trades, open_trades):
     symbol_items = [html.Li(symbol) for symbol in symbols] if symbols else [html.Li("No symbols loaded")]
@@ -107,6 +122,9 @@ def build_layout(symbols, trades, open_trades):
     open_trade_table = dash_table.DataTable(
         columns=[{"name": col.replace("_", " ").title(), "id": col} for col in open_trades.columns],
         data=open_trades.to_dict("records"),
+        row_selectable="single",
+        selected_rows=[],
+        id="open-trades-table",
         page_size=10,
         style_table={"overflowX": "auto"},
         style_header={"backgroundColor": "#111827", "color": "white", "fontWeight": "bold"},
@@ -125,7 +143,7 @@ def build_layout(symbols, trades, open_trades):
     return html.Div(
         style={"maxWidth": "1000px", "margin": "40px auto", "fontFamily": "Arial"},
         children=[
-            html.H1("Oanda Trading Dashboard"),
+            html.H1("EMA_VWAP Trading Dashboard"),
             html.P(f"Last updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"),
             html.Div(
                 style={"display": "flex", "gap": "32px"},
@@ -142,6 +160,8 @@ def build_layout(symbols, trades, open_trades):
                         children=[
                             html.H3("Open Trades"),
                             open_trade_table,
+                            html.Button("Close Selected Trade", id="close-trade-button", n_clicks=0),
+                            html.Div(id="close-status", style={"marginTop": "8px", "color": "#b91c1c"}),
                             html.H3("Trade History"),
                             trade_table,
                         ],
@@ -153,6 +173,7 @@ def build_layout(symbols, trades, open_trades):
 
 
 app = Dash(__name__)
+app.title = "EMA_VWAP"
 server = app.server
 
 app.layout = html.Div(
@@ -166,6 +187,29 @@ app.layout = html.Div(
 @app.callback(Output("dashboard-content", "children"), Input("refresh", "n_intervals"))
 def refresh_dashboard(_):
     return build_layout(load_symbols(), load_trades(), fetch_open_trades())
+
+
+@app.callback(
+    Output("close-status", "children"),
+    Input("close-trade-button", "n_clicks"),
+    State("open-trades-table", "selected_rows"),
+    State("open-trades-table", "data"),
+)
+def close_selected_trade(n_clicks, selected_rows, open_trades_data):
+    if not n_clicks:
+        return no_update
+    if not selected_rows:
+        return "Select a trade to close."
+    selected_index = selected_rows[0]
+    if not open_trades_data or selected_index >= len(open_trades_data):
+        return "Selected trade not found."
+    trade_id = open_trades_data[selected_index].get("id")
+    if not trade_id:
+        return "Selected trade is missing an ID."
+    success, message = close_trade(trade_id)
+    if success:
+        return f"{message} Refreshing shortly."
+    return message
 
 
 if __name__ == "__main__":
