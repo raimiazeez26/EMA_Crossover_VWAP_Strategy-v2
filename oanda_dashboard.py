@@ -25,9 +25,9 @@ def load_symbols():
     return [asset.get("symbol") for asset in assets if asset.get("symbol")]
 
 
-def load_trades():
-    if not os.path.exists(TRADE_HISTORY_PATH):
-        return pd.DataFrame(columns=[
+def _empty_trade_history_frame():
+    return pd.DataFrame(
+        columns=[
             "timestamp",
             "symbol",
             "signal",
@@ -36,13 +36,74 @@ def load_trades():
             "stop_loss",
             "take_profit",
             "strategy",
-        ])
+            "close_time",
+            "realized_pl",
+        ]
+    )
+
+
+def _load_trade_history_csv():
+    if not os.path.exists(TRADE_HISTORY_PATH):
+        return _empty_trade_history_frame()
     trades = pd.read_csv(TRADE_HISTORY_PATH)
-    if not trades.empty:
+    if trades.empty:
+        return _empty_trade_history_frame()
+    if "timestamp" in trades.columns:
         trades["timestamp"] = pd.to_datetime(trades["timestamp"], errors="coerce")
     if "strategy" in trades.columns:
         trades = trades[trades["strategy"] == STRATEGY_NAME]
     return trades
+
+
+def fetch_closed_trades():
+    token = os.getenv("OANDA_TOKEN")
+    account_id = os.getenv("OANDA_ACCOUNT_ID")
+    base_url = os.getenv("OANDA_API_BASE_URL", "https://api-fxpractice.oanda.com")
+    if not token or not account_id:
+        return _empty_trade_history_frame()
+    url = f"{base_url}/v3/accounts/{account_id}/trades"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    try:
+        response = requests.get(url, headers=headers, params={"state": "CLOSED"}, timeout=20)
+        response.raise_for_status()
+        payload = response.json()
+    except requests.RequestException:
+        return _empty_trade_history_frame()
+    rows = []
+    for trade in payload.get("trades", []):
+        extensions = trade.get("clientExtensions") or trade.get("tradeClientExtensions") or {}
+        if not _matches_strategy(extensions):
+            continue
+        rows.append(
+            {
+                "timestamp": trade.get("openTime"),
+                "close_time": trade.get("closeTime"),
+                "symbol": trade.get("instrument"),
+                "signal": "BUY" if float(trade.get("initialUnits", 0)) > 0 else "SELL",
+                "units": trade.get("initialUnits"),
+                "entry_price": trade.get("price"),
+                "stop_loss": trade.get("stopLossOrder", {}).get("price"),
+                "take_profit": trade.get("takeProfitOrder", {}).get("price"),
+                "strategy": STRATEGY_NAME,
+                "realized_pl": trade.get("realizedPL"),
+            }
+        )
+    if not rows:
+        return _empty_trade_history_frame()
+    closed_df = pd.DataFrame(rows)
+    closed_df["timestamp"] = pd.to_datetime(closed_df["timestamp"], errors="coerce")
+    closed_df["close_time"] = pd.to_datetime(closed_df["close_time"], errors="coerce")
+    return closed_df
+
+
+def load_trades():
+    trades = _load_trade_history_csv()
+    closed_trades = fetch_closed_trades()
+    if trades.empty and closed_trades.empty:
+        return _empty_trade_history_frame()
+    combined = pd.concat([trades, closed_trades], ignore_index=True)
+    combined = combined.drop_duplicates(subset=["timestamp", "symbol", "units", "entry_price", "close_time"])
+    return combined
 
 
 def _matches_strategy(extensions):
