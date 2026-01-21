@@ -774,23 +774,40 @@ class OandaAdvancedTradingBot:
             return
         account = self._request("GET", f"/v3/accounts/{self.oanda_account_id}")
         nav = float(account["account"]["NAV"])
-        if self.last_nav is None:
-            self.last_nav = nav
-            self.last_eod_date = today
-            return
-        pnl = nav - self.last_nav
-        pnl_percent = (pnl / self.last_nav) * 100 if self.last_nav else 0.0
-        message = f"EOD PnL for {today}: {pnl:.2f} ({pnl_percent:.2f}%). NAV: {nav:.2f}"
+        closed_payload = self._request(
+            "GET", f"/v3/accounts/{self.oanda_account_id}/trades", params={"state": "CLOSED"}
+        )
+        closed_today = []
+        for trade in closed_payload.get("trades", []):
+            extensions = trade.get("clientExtensions") or trade.get("tradeClientExtensions") or {}
+            if not self._order_extensions_match(extensions):
+                continue
+            close_time = trade.get("closeTime")
+            if not close_time:
+                continue
+            try:
+                close_dt = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if close_dt.date() == today:
+                closed_today.append(trade)
+        pnl = sum(float(trade.get("realizedPL", 0)) for trade in closed_today)
+        pnl_percent = (pnl / nav) * 100 if nav else 0.0
+        trade_count = len(closed_today)
+        message = (
+            f"EOD PnL for {today}: {pnl:.2f} ({pnl_percent:.2f}%). "
+            f"Closed trades: {trade_count}. NAV: {nav:.2f}"
+        )
         self.send_telegram(message)
         logging.info(message)
         if now.weekday() == 4 and self.last_weekly_update_date != today:
             weekly_message = (
-                f"Weekly update (Friday) {today}: EOD PnL {pnl:.2f} ({pnl_percent:.2f}%). NAV: {nav:.2f}"
+                f"Weekly update (Friday) {today}: EOD PnL {pnl:.2f} ({pnl_percent:.2f}%). "
+                f"Closed trades: {trade_count}. NAV: {nav:.2f}"
             )
             self.send_telegram(weekly_message)
             logging.info(weekly_message)
             self.last_weekly_update_date = today
-        self.last_nav = nav
         self.last_eod_date = today
 
     def run(self):
