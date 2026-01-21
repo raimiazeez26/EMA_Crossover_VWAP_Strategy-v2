@@ -714,13 +714,25 @@ class OandaAdvancedTradingBot:
             if not trade_id or trade_id in self.trade_message_map:
                 continue
             extension_id = extensions.get("id")
-            message_id = None
+            reply_to = None
             if extension_id:
-                message_id = self.order_message_map.get(extension_id)
-            if not message_id:
-                message_id = self.order_message_map.get(trade.get("orderID"))
-            if message_id:
-                self.trade_message_map[trade_id] = message_id
+                reply_to = self.order_message_map.get(extension_id)
+            if not reply_to:
+                reply_to = self.order_message_map.get(trade.get("orderID"))
+            message = "\n".join(
+                [
+                    f"Activated: {self.strategy_name}",
+                    f"Symbol: {trade.get('instrument')}",
+                    f"Units: {trade.get('currentUnits')}",
+                    f"Trade ID: {trade_id}",
+                    f"Entry: {trade.get('price')}",
+                    f"Open Time: {trade.get('openTime')}",
+                    f"Time (UTC): {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}",
+                ]
+            )
+            activation_message_id = self.send_telegram(message, reply_to_message_id=reply_to)
+            if activation_message_id:
+                self.trade_message_map[trade_id] = activation_message_id
 
         for trade in closed_trades_payload.get("trades", []):
             trade_id = trade.get("id")
