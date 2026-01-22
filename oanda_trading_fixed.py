@@ -3,7 +3,7 @@ import logging
 import os
 import time
 import warnings
-from datetime import datetime
+from datetime import datetime, timedelta
 from uuid import uuid4
 
 import numpy as np
@@ -781,8 +781,8 @@ class OandaAdvancedTradingBot:
     def send_eod_pnl(self):
         logging.info("Checking EOD PnL")
         now = datetime.utcnow()
-        today = now.date()
-        if self.last_eod_date == today:
+        target_date = now.date() - timedelta(days=1)
+        if self.last_eod_date == target_date:
             return
         account = self._request("GET", f"/v3/accounts/{self.oanda_account_id}")
         nav = float(account["account"]["NAV"])
@@ -801,26 +801,26 @@ class OandaAdvancedTradingBot:
                 close_dt = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
             except ValueError:
                 continue
-            if close_dt.date() == today:
+            if close_dt.date() == target_date:
                 closed_today.append(trade)
         pnl = sum(float(trade.get("realizedPL", 0)) for trade in closed_today)
         pnl_percent = (pnl / nav) * 100 if nav else 0.0
         trade_count = len(closed_today)
         message = (
-            f"EOD PnL for {today}: {pnl:.2f} ({pnl_percent:.2f}%). "
+            f"EOD PnL for {target_date}: {pnl:.2f} ({pnl_percent:.2f}%). "
             f"Closed trades: {trade_count}. NAV: {nav:.2f}"
         )
         self.send_telegram(message)
         logging.info(message)
-        if now.weekday() == 4 and self.last_weekly_update_date != today:
+        if target_date.weekday() == 4 and self.last_weekly_update_date != target_date:
             weekly_message = (
-                f"Weekly update (Friday) {today}: EOD PnL {pnl:.2f} ({pnl_percent:.2f}%). "
+                f"Weekly update (Friday) {target_date}: EOD PnL {pnl:.2f} ({pnl_percent:.2f}%). "
                 f"Closed trades: {trade_count}. NAV: {nav:.2f}"
             )
             self.send_telegram(weekly_message)
             logging.info(weekly_message)
-            self.last_weekly_update_date = today
-        self.last_eod_date = today
+            self.last_weekly_update_date = target_date
+        self.last_eod_date = target_date
 
     def run(self):
         logging.info("Starting Oanda trading bot...")

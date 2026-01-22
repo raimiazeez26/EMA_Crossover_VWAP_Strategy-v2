@@ -64,7 +64,7 @@ def fetch_closed_trades():
     url = f"{base_url}/v3/accounts/{account_id}/trades"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     try:
-        response = requests.get(url, headers=headers, params={"state": "CLOSED"}, timeout=20)
+        response = requests.get(url, headers=headers, params={"state": "CLOSED", "count": 500}, timeout=20)
         response.raise_for_status()
         payload = response.json()
     except requests.RequestException:
@@ -103,6 +103,7 @@ def load_trades():
         return _empty_trade_history_frame()
     combined = pd.concat([trades, closed_trades], ignore_index=True)
     combined = combined.drop_duplicates(subset=["timestamp", "symbol", "units", "entry_price", "close_time"])
+    combined = combined.sort_values(["close_time", "timestamp"], ascending=False, na_position="last")
     return combined
 
 
