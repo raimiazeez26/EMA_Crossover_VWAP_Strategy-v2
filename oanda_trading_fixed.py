@@ -60,12 +60,17 @@ class OandaAdvancedTradingBot:
         self.last_eod_date = None
         self.last_nav = None
         self.last_weekly_update_date = None
+        self.current_day = datetime.utcnow().date()
         self.instrument_meta = {}
         self.order_message_map = {}
         self.trade_message_map = {}
         self.closed_trade_notified = set()
         self.closed_order_notified = set()
         self.pending_orders = {}
+        self.known_order_ids = set()
+        self.order_to_trade_map = {}
+        self.tracked_trade_ids = set()
+        self.state_path = os.getenv("TELEGRAM_STATE_PATH", "backtest_outputs/telegram_state.json")
 
         self.oanda_token = os.getenv("OANDA_TOKEN")
         self.oanda_account_id = os.getenv("OANDA_ACCOUNT_ID")
@@ -78,18 +83,24 @@ class OandaAdvancedTradingBot:
         if not self.oanda_token or not self.oanda_account_id:
             raise ValueError("Missing OANDA_TOKEN or OANDA_ACCOUNT_ID in environment")
 
+        self._load_state()
         self.sync_existing_positions()
+        self._save_state()
 
     def _request(self, method, path, payload=None, params=None):
         url = f"{self.oanda_base_url}{path}"
-        headers = {
-            "Authorization": f"Bearer {self.oanda_token}",
-            "Content-Type": "application/json",
-        }
+        headers = self._auth_headers()
         logging.debug("Oanda request %s %s params=%s payload=%s", method, url, params, payload)
         response = requests.request(method, url, headers=headers, json=payload, params=params, timeout=30)
         response.raise_for_status()
         return response.json()
+
+    def _auth_headers(self):
+        return {
+            "Authorization": f"Bearer {self.oanda_token}",
+            "Content-Type": "application/json",
+            "Cache-Control": "no-cache",
+        }
 
     def normalize_symbol(self, symbol):
         if "_" in symbol:
@@ -192,6 +203,69 @@ class OandaAdvancedTradingBot:
             return timeframe_value
         return mapping.get(int(timeframe_value), "M5")
 
+    def _load_state(self):
+        if not self.state_path:
+            return
+        try:
+            with open(self.state_path, "r", encoding="utf-8") as handle:
+                state = json.load(handle)
+        except FileNotFoundError:
+            return
+        except (ValueError, json.JSONDecodeError) as exc:
+            logging.warning("Failed to parse state file %s: %s", self.state_path, exc)
+            return
+
+        self.order_message_map.update(state.get("order_message_map", {}))
+        self.trade_message_map.update(state.get("trade_message_map", {}))
+        self.order_to_trade_map.update(state.get("order_to_trade_map", {}))
+        self.closed_trade_notified = set(state.get("closed_trade_notified", []))
+        self.closed_order_notified = set(state.get("closed_order_notified", []))
+        self.known_order_ids = set(state.get("known_order_ids", []))
+        self.tracked_trade_ids = set(state.get("tracked_trade_ids", []))
+
+        last_eod = state.get("last_eod_date")
+        if last_eod:
+            try:
+                self.last_eod_date = datetime.fromisoformat(last_eod).date()
+            except ValueError:
+                logging.warning("Invalid last_eod_date in state: %s", last_eod)
+        last_weekly = state.get("last_weekly_update_date")
+        if last_weekly:
+            try:
+                self.last_weekly_update_date = datetime.fromisoformat(last_weekly).date()
+            except ValueError:
+                logging.warning("Invalid last_weekly_update_date in state: %s", last_weekly)
+        current_day = state.get("current_day")
+        if current_day:
+            try:
+                self.current_day = datetime.fromisoformat(current_day).date()
+            except ValueError:
+                logging.warning("Invalid current_day in state: %s", current_day)
+
+    def _save_state(self):
+        if not self.state_path:
+            return
+        state_dir = os.path.dirname(self.state_path)
+        if state_dir:
+            os.makedirs(state_dir, exist_ok=True)
+        state = {
+            "order_message_map": self.order_message_map,
+            "trade_message_map": self.trade_message_map,
+            "order_to_trade_map": self.order_to_trade_map,
+            "closed_trade_notified": sorted(self.closed_trade_notified),
+            "closed_order_notified": sorted(self.closed_order_notified),
+            "known_order_ids": sorted(self.known_order_ids),
+            "tracked_trade_ids": sorted(self.tracked_trade_ids),
+            "last_eod_date": self.last_eod_date.isoformat() if self.last_eod_date else None,
+            "last_weekly_update_date": self.last_weekly_update_date.isoformat() if self.last_weekly_update_date else None,
+            "current_day": self.current_day.isoformat() if self.current_day else None,
+        }
+        try:
+            with open(self.state_path, "w", encoding="utf-8") as handle:
+                json.dump(state, handle)
+        except OSError as exc:
+            logging.warning("Failed to write state file %s: %s", self.state_path, exc)
+
     def send_telegram(self, message, reply_to_message_id=None):
         if not self.telegram_token or not self.telegram_chat_id:
             return None
@@ -237,6 +311,58 @@ class OandaAdvancedTradingBot:
             return None
 
         return {"bid": bid, "ask": ask, "instrument": oanda_symbol}
+
+    @staticmethod
+    def _parse_oanda_time(value):
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _format_oanda_time(value):
+        return value.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    @staticmethod
+    def _transaction_delta(txn):
+        delta = 0.0
+        for key in ("pl", "financing", "commission", "guaranteedExecutionFee"):
+            raw = txn.get(key)
+            if raw is None:
+                continue
+            try:
+                delta += float(raw)
+            except (TypeError, ValueError):
+                continue
+        return delta
+
+    def _fetch_transactions_between(self, start_dt, end_dt):
+        params = {
+            "from": self._format_oanda_time(start_dt),
+            "to": self._format_oanda_time(end_dt),
+            "count": 1000,
+        }
+        try:
+            payload = self._request(
+                "GET", f"/v3/accounts/{self.oanda_account_id}/transactions", params=params
+            )
+        except requests.RequestException as exc:
+            logging.warning("Transaction lookup failed: %s", exc)
+            return []
+
+        transactions = list(payload.get("transactions", []))
+        for page_url in payload.get("pages", []):
+            try:
+                response = requests.get(page_url, headers=self._auth_headers(), timeout=30)
+                response.raise_for_status()
+                page_payload = response.json()
+            except requests.RequestException as exc:
+                logging.warning("Transaction page fetch failed: %s", exc)
+                continue
+            transactions.extend(page_payload.get("transactions", []))
+        return transactions
 
     def _order_extensions_match(self, extensions):
         if not extensions:
@@ -291,6 +417,8 @@ class OandaAdvancedTradingBot:
                 continue
             current_orders[order_id] = order
 
+        self.known_order_ids.update(current_orders.keys())
+
         for order_id, order in current_orders.items():
             pricing = self.fetch_pricing(order.get("instrument"))
             if not pricing:
@@ -312,12 +440,15 @@ class OandaAdvancedTradingBot:
                     reply_to = self.order_message_map.get(order_id)
                     self.send_telegram(message, reply_to_message_id=reply_to)
                     self.closed_order_notified.add(order_id)
+                    self.known_order_ids.discard(order_id)
+                    self._save_state()
                 except requests.RequestException as exc:
                     logging.warning("Failed to cancel order %s: %s", order_id, exc)
 
-        missing_orders = set(self.pending_orders) - set(current_orders)
+        missing_orders = set(self.known_order_ids) - set(current_orders)
         for order_id in missing_orders:
             if order_id in self.closed_order_notified:
+                self.known_order_ids.discard(order_id)
                 continue
             try:
                 order_payload = self._request(
@@ -328,7 +459,8 @@ class OandaAdvancedTradingBot:
                 continue
             order = order_payload.get("order", {})
             state = order.get("state", "UNKNOWN")
-            if str(state).upper() == "CANCELLED":
+            state_upper = str(state).upper()
+            if state_upper == "CANCELLED":
                 message = "\n".join(
                     [
                         f"Order canceled: {self.strategy_name}",
@@ -341,8 +473,13 @@ class OandaAdvancedTradingBot:
                 reply_to = self.order_message_map.get(order_id)
                 self.send_telegram(message, reply_to_message_id=reply_to)
                 self.closed_order_notified.add(order_id)
+                self.known_order_ids.discard(order_id)
+                self._save_state()
+            elif state_upper in {"FILLED", "TRIGGERED"}:
+                self.known_order_ids.discard(order_id)
 
         self.pending_orders = current_orders
+        self._save_state()
 
     def send_keepalive(self):
         if not self.keepalive_url:
@@ -658,6 +795,10 @@ class OandaAdvancedTradingBot:
                 logging.warning("Order canceled immediately for %s. reason=%s response=%s", oanda_symbol, summary["reason"], resp)
                 return
 
+            order_id = summary.get("order_id")
+            if order_id:
+                self.known_order_ids.add(order_id)
+
             self.active_symbols.add(oanda_symbol)
             record_trade(
                 {
@@ -676,6 +817,8 @@ class OandaAdvancedTradingBot:
                     f"Signal: {self.strategy_name} ({signal})",
                     f"Symbol: {oanda_symbol}",
                     f"Order Type: {order_type}",
+                    f"Order ID: {order_id or 'N/A'}",
+                    f"Client ID: {client_extension_id}",
                     f"Units: {units}",
                     f"Entry: {_format_price(entry_price, price_precision)}",
                     f"Stop Loss: {_format_price(stop_loss, price_precision)}",
@@ -686,9 +829,9 @@ class OandaAdvancedTradingBot:
             message_id = self.send_telegram(message)
             if message_id:
                 self.order_message_map[client_extension_id] = message_id
-                order_id = summary.get("order_id")
                 if order_id:
                     self.order_message_map[order_id] = message_id
+            self._save_state()
         except requests.RequestException as exc:
             logging.warning("Order placement failed for %s: %s", symbol, exc)
 
@@ -696,11 +839,13 @@ class OandaAdvancedTradingBot:
         try:
             open_trades_payload = self._request("GET", f"/v3/accounts/{self.oanda_account_id}/openTrades")
             closed_trades_payload = self._request(
-                "GET", f"/v3/accounts/{self.oanda_account_id}/trades", params={"state": "CLOSED"}
+                "GET", f"/v3/accounts/{self.oanda_account_id}/trades", params={"state": "CLOSED", "count": 500}
             )
         except requests.RequestException as exc:
             logging.warning("Trade sync failed: %s", exc)
             return
+
+        state_changed = False
 
         for trade in open_trades_payload.get("trades", []):
             extensions = (
@@ -708,17 +853,27 @@ class OandaAdvancedTradingBot:
                 or trade.get("tradeClientExtensions")
                 or {}
             )
-            if not self._order_extensions_match(extensions):
-                continue
             trade_id = trade.get("id")
             if not trade_id or trade_id in self.trade_message_map:
+                continue
+            order_id = trade.get("orderID")
+            extensions_match = self._order_extensions_match(extensions)
+            order_known = bool(
+                order_id
+                and (
+                    order_id in self.known_order_ids
+                    or order_id in self.order_message_map
+                    or order_id in self.order_to_trade_map
+                )
+            )
+            if not (extensions_match or order_known or trade_id in self.tracked_trade_ids):
                 continue
             extension_id = extensions.get("id")
             reply_to = None
             if extension_id:
                 reply_to = self.order_message_map.get(extension_id)
             if not reply_to:
-                reply_to = self.order_message_map.get(trade.get("orderID"))
+                reply_to = self.order_message_map.get(order_id)
             message = "\n".join(
                 [
                     f"Activated: {self.strategy_name}",
@@ -733,17 +888,27 @@ class OandaAdvancedTradingBot:
             activation_message_id = self.send_telegram(message, reply_to_message_id=reply_to)
             if activation_message_id:
                 self.trade_message_map[trade_id] = activation_message_id
+            elif reply_to:
+                self.trade_message_map[trade_id] = reply_to
+            if order_id:
+                self.order_to_trade_map[order_id] = trade_id
+                self.known_order_ids.discard(order_id)
+            self.tracked_trade_ids.add(trade_id)
+            state_changed = True
 
         for trade in closed_trades_payload.get("trades", []):
             trade_id = trade.get("id")
             if not trade_id or trade_id in self.closed_trade_notified:
                 continue
+            order_id = trade.get("orderID")
             extensions = (
                 trade.get("clientExtensions")
                 or trade.get("tradeClientExtensions")
                 or {}
             )
-            if trade_id not in self.trade_message_map and not self._order_extensions_match(extensions):
+            extensions_match = self._order_extensions_match(extensions)
+            order_known = bool(order_id and (order_id in self.order_to_trade_map or order_id in self.order_message_map))
+            if trade_id not in self.trade_message_map and not (extensions_match or order_known or trade_id in self.tracked_trade_ids):
                 continue
             realized_pl = float(trade.get("realizedPL", 0))
             outcome = "WIN" if realized_pl >= 0 else "LOSS"
@@ -760,67 +925,119 @@ class OandaAdvancedTradingBot:
                     f"Result: {outcome}",
                 ]
             )
-            reply_to = self.trade_message_map.get(trade_id)
+            reply_to = self.trade_message_map.get(trade_id) or self.order_message_map.get(order_id)
             self.send_telegram(message, reply_to_message_id=reply_to)
             self.closed_trade_notified.add(trade_id)
+            self.tracked_trade_ids.discard(trade_id)
+            if order_id:
+                self.known_order_ids.discard(order_id)
+                self.order_to_trade_map.pop(order_id, None)
+            state_changed = True
+
+        if state_changed:
+            self._save_state()
 
     def sync_existing_positions(self):
         logging.info("Syncing existing positions")
         trades_payload = self._request("GET", f"/v3/accounts/{self.oanda_account_id}/openTrades")
-        self.active_symbols = {
-            trade.get("instrument")
-            for trade in trades_payload.get("trades", [])
-            if trade.get("instrument")
-            and self._order_extensions_match(
-                trade.get("clientExtensions") or trade.get("tradeClientExtensions") or {}
-            )
-        }
+        active_symbols = set()
+        for trade in trades_payload.get("trades", []):
+            instrument = trade.get("instrument")
+            if not instrument:
+                continue
+            extensions = trade.get("clientExtensions") or trade.get("tradeClientExtensions") or {}
+            if not self._order_extensions_match(extensions):
+                continue
+            active_symbols.add(instrument)
+            trade_id = trade.get("id")
+            order_id = trade.get("orderID")
+            if trade_id:
+                self.tracked_trade_ids.add(trade_id)
+            if order_id and trade_id:
+                self.order_to_trade_map[order_id] = trade_id
+        self.active_symbols = active_symbols
         if self.active_symbols:
             logging.info("Synced existing positions for %s symbols", len(self.active_symbols))
+        self._save_state()
 
     def send_eod_pnl(self):
         logging.info("Checking EOD PnL")
         now = datetime.utcnow()
-        target_date = now.date() - timedelta(days=1)
+        today = now.date()
+        if today != self.current_day:
+            target_date = self.current_day
+        elif self.last_eod_date is None and now.hour >= 1:
+            target_date = today - timedelta(days=1)
+        else:
+            return
         if self.last_eod_date == target_date:
+            self.current_day = today
+            self._save_state()
             return
         account = self._request("GET", f"/v3/accounts/{self.oanda_account_id}")
-        nav = float(account["account"]["NAV"])
+        balance_now = float(account["account"]["balance"])
         closed_payload = self._request(
-            "GET", f"/v3/accounts/{self.oanda_account_id}/trades", params={"state": "CLOSED"}
+            "GET", f"/v3/accounts/{self.oanda_account_id}/trades", params={"state": "CLOSED", "count": 500}
         )
-        closed_today = []
-        for trade in closed_payload.get("trades", []):
+
+        start_dt = datetime.combine(target_date, datetime.min.time())
+        end_dt = start_dt + timedelta(days=1)
+
+        transactions_after_end = self._fetch_transactions_between(end_dt, now)
+        delta_after_end = sum(self._transaction_delta(txn) for txn in transactions_after_end)
+        balance_end = balance_now - delta_after_end
+
+        def _is_strategy_trade(trade):
             extensions = trade.get("clientExtensions") or trade.get("tradeClientExtensions") or {}
             if not self._order_extensions_match(extensions):
+                trade_id = trade.get("id")
+                order_id = trade.get("orderID")
+                if trade_id and (
+                    trade_id in self.tracked_trade_ids
+                    or trade_id in self.trade_message_map
+                    or trade_id in self.closed_trade_notified
+                ):
+                    return True
+                if order_id and (
+                    order_id in self.order_message_map
+                    or order_id in self.order_to_trade_map
+                    or order_id in self.known_order_ids
+                ):
+                    return True
+                return False
+            return True
+
+        closed_today = []
+        for trade in closed_payload.get("trades", []):
+            if not _is_strategy_trade(trade):
                 continue
-            close_time = trade.get("closeTime")
-            if not close_time:
-                continue
-            try:
-                close_dt = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
-            except ValueError:
-                continue
-            if close_dt.date() == target_date:
+            close_dt = self._parse_oanda_time(trade.get("closeTime"))
+            if close_dt and close_dt.date() == target_date:
                 closed_today.append(trade)
-        pnl = sum(float(trade.get("realizedPL", 0)) for trade in closed_today)
-        pnl_percent = (pnl / nav) * 100 if nav else 0.0
+
+        pnl_total = sum(float(trade.get("realizedPL", 0)) for trade in closed_today)
+        start_balance = balance_end - pnl_total
+        pnl_percent = (pnl_total / start_balance) * 100 if start_balance else 0.0
         trade_count = len(closed_today)
         message = (
-            f"EOD PnL for {target_date}: {pnl:.2f} ({pnl_percent:.2f}%). "
-            f"Closed trades: {trade_count}. NAV: {nav:.2f}"
+            f"EOD PnL for {target_date}: {pnl_total:.2f} ({pnl_percent:.2f}%). "
+            f"Closed trades: {trade_count}. Start balance: {start_balance:.2f}. "
+            f"End balance: {balance_end:.2f}"
         )
         self.send_telegram(message)
         logging.info(message)
         if target_date.weekday() == 4 and self.last_weekly_update_date != target_date:
             weekly_message = (
-                f"Weekly update (Friday) {target_date}: EOD PnL {pnl:.2f} ({pnl_percent:.2f}%). "
-                f"Closed trades: {trade_count}. NAV: {nav:.2f}"
+                f"Weekly update (Friday) {target_date}: EOD PnL {pnl_total:.2f} ({pnl_percent:.2f}%). "
+                f"Closed trades: {trade_count}. Start balance: {start_balance:.2f}. "
+                f"End balance: {balance_end:.2f}"
             )
             self.send_telegram(weekly_message)
             logging.info(weekly_message)
             self.last_weekly_update_date = target_date
         self.last_eod_date = target_date
+        self.current_day = today
+        self._save_state()
 
     def run(self):
         logging.info("Starting Oanda trading bot...")
