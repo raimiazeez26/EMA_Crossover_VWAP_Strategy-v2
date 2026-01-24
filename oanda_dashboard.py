@@ -1,4 +1,5 @@
 import os
+import time
 from datetime import datetime
 
 import json
@@ -11,6 +12,15 @@ from dash import Dash, Input, Output, State, dcc, html, dash_table, no_update
 SYMBOL_PARAMS_PATH = "backtest_outputs/symbol_params_latest.json"
 TRADE_HISTORY_PATH = "backtest_outputs/oanda_trade_history.csv"
 STRATEGY_NAME = "EMA_VWAP"
+
+
+def _headers(token):
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
 
 
 def load_symbols():
@@ -62,9 +72,14 @@ def fetch_closed_trades():
     if not token or not account_id:
         return _empty_trade_history_frame()
     url = f"{base_url}/v3/accounts/{account_id}/trades"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    headers = _headers(token)
     try:
-        response = requests.get(url, headers=headers, params={"state": "CLOSED", "count": 500}, timeout=20)
+        response = requests.get(
+            url,
+            headers=headers,
+            params={"state": "CLOSED", "count": 500, "_": int(time.time())},
+            timeout=20,
+        )
         response.raise_for_status()
         payload = response.json()
     except requests.RequestException:
@@ -130,9 +145,9 @@ def fetch_open_trades():
             ]
         )
     url = f"{base_url}/v3/accounts/{account_id}/openTrades"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    headers = _headers(token)
     try:
-        response = requests.get(url, headers=headers, timeout=20)
+        response = requests.get(url, headers=headers, params={"_": int(time.time())}, timeout=20)
         response.raise_for_status()
         payload = response.json()
     except requests.RequestException:
@@ -169,7 +184,7 @@ def close_trade(trade_id):
     if not token or not account_id:
         return False, "Missing OANDA credentials."
     url = f"{base_url}/v3/accounts/{account_id}/trades/{trade_id}/close"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    headers = _headers(token)
     try:
         response = requests.put(url, headers=headers, timeout=20)
         response.raise_for_status()
