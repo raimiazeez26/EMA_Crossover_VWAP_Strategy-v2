@@ -3,7 +3,7 @@ import logging
 import os
 import time
 import warnings
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import numpy as np
@@ -363,6 +363,120 @@ class OandaAdvancedTradingBot:
                 continue
             transactions.extend(page_payload.get("transactions", []))
         return transactions
+
+    @staticmethod
+    def _ensure_utc(dt_value):
+        if dt_value.tzinfo is None:
+            return dt_value.replace(tzinfo=timezone.utc)
+        return dt_value.astimezone(timezone.utc)
+
+    def _is_strategy_context(self, payload, trade_id=None, order_id=None):
+        extensions = (
+            payload.get("clientExtensions")
+            or payload.get("orderClientExtensions")
+            or payload.get("tradeClientExtensions")
+            or {}
+        )
+        if self._order_extensions_match(extensions):
+            return True
+
+        if trade_id and (
+            str(trade_id) in self.tracked_trade_ids
+            or str(trade_id) in self.trade_message_map
+            or str(trade_id) in self.closed_trade_notified
+        ):
+            return True
+
+        if order_id and (
+            str(order_id) in self.order_message_map
+            or str(order_id) in self.order_to_trade_map
+            or str(order_id) in self.known_order_ids
+        ):
+            return True
+        return False
+
+    @staticmethod
+    def _extract_closed_trade_ids_from_transaction(txn):
+        trade_ids = set()
+
+        trade_closed = txn.get("tradeClosed")
+        if isinstance(trade_closed, dict) and trade_closed.get("tradeID"):
+            trade_ids.add(str(trade_closed["tradeID"]))
+
+        trade_reduced = txn.get("tradeReduced")
+        if isinstance(trade_reduced, dict) and trade_reduced.get("tradeID"):
+            trade_ids.add(str(trade_reduced["tradeID"]))
+
+        for item in txn.get("tradesClosed", []):
+            if isinstance(item, dict) and item.get("tradeID"):
+                trade_ids.add(str(item["tradeID"]))
+
+        return trade_ids
+
+    def _compute_strategy_eod_from_transactions(self, target_date, now):
+        start_dt = datetime.combine(target_date, datetime.min.time(), tzinfo=timezone.utc)
+        end_dt = start_dt + timedelta(days=1)
+        transactions = self._fetch_transactions_between(start_dt, end_dt)
+
+        pnl_total = 0.0
+        closed_trade_ids = set()
+
+        for txn in transactions:
+            txn_type = str(txn.get("type", "")).upper()
+            if txn_type != "ORDER_FILL":
+                continue
+
+            trade_ids = self._extract_closed_trade_ids_from_transaction(txn)
+            if not trade_ids:
+                continue
+
+            order_id = txn.get("orderID") or txn.get("id")
+            if not self._is_strategy_context(txn, order_id=order_id) and not any(
+                self._is_strategy_context(txn, trade_id=trade_id, order_id=order_id)
+                for trade_id in trade_ids
+            ):
+                continue
+
+            pnl_total += self._transaction_delta(txn)
+            closed_trade_ids.update(trade_ids)
+
+        transactions_after_end = self._fetch_transactions_between(end_dt, self._ensure_utc(now))
+        delta_after_end = sum(self._transaction_delta(txn) for txn in transactions_after_end)
+
+        return pnl_total, closed_trade_ids, delta_after_end
+
+    def _next_market_resume_time(self, now):
+        weekday = now.weekday()
+        if weekday < 5:
+            return now
+        days_until_monday = (7 - weekday) % 7
+        if days_until_monday == 0:
+            days_until_monday = 7
+        monday = (now + timedelta(days=days_until_monday)).date()
+        return datetime.combine(monday, datetime.min.time())
+
+    def _sleep_until_market_resume(self, now):
+        resume_time = self._next_market_resume_time(now)
+        logging.info(
+            "Weekend detected (UTC). Trading paused until %s UTC.",
+            resume_time.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        while True:
+            current = datetime.utcnow()
+            if current.weekday() < 5:
+                logging.info("Weekday resumed (UTC). Restarting trading cycle.")
+                return
+            remaining = int((resume_time - current).total_seconds())
+            if remaining <= 0:
+                return
+            sleep_chunk = min(remaining, 15 * 60)
+            logging.info(
+                "Weekend sleep heartbeat: %ss remaining until resume (sleeping %ss).",
+                max(remaining, 0),
+                sleep_chunk,
+            )
+            self.send_keepalive()
+            time.sleep(max(60, sleep_chunk))
 
     def _order_extensions_match(self, extensions):
         if not extensions:
@@ -962,7 +1076,7 @@ class OandaAdvancedTradingBot:
 
     def send_eod_pnl(self):
         logging.info("Checking EOD PnL")
-        now = datetime.utcnow()
+        now = datetime.utcnow().replace(tzinfo=timezone.utc)
         today = now.date()
         if today != self.current_day:
             target_date = self.current_day
@@ -976,49 +1090,12 @@ class OandaAdvancedTradingBot:
             return
         account = self._request("GET", f"/v3/accounts/{self.oanda_account_id}")
         balance_now = float(account["account"]["balance"])
-        closed_payload = self._request(
-            "GET", f"/v3/accounts/{self.oanda_account_id}/trades", params={"state": "CLOSED", "count": 500}
-        )
-
-        start_dt = datetime.combine(target_date, datetime.min.time())
-        end_dt = start_dt + timedelta(days=1)
-
-        transactions_after_end = self._fetch_transactions_between(end_dt, now)
-        delta_after_end = sum(self._transaction_delta(txn) for txn in transactions_after_end)
+        pnl_total, closed_trade_ids, delta_after_end = self._compute_strategy_eod_from_transactions(target_date, now)
         balance_end = balance_now - delta_after_end
 
-        def _is_strategy_trade(trade):
-            extensions = trade.get("clientExtensions") or trade.get("tradeClientExtensions") or {}
-            if not self._order_extensions_match(extensions):
-                trade_id = trade.get("id")
-                order_id = trade.get("orderID")
-                if trade_id and (
-                    trade_id in self.tracked_trade_ids
-                    or trade_id in self.trade_message_map
-                    or trade_id in self.closed_trade_notified
-                ):
-                    return True
-                if order_id and (
-                    order_id in self.order_message_map
-                    or order_id in self.order_to_trade_map
-                    or order_id in self.known_order_ids
-                ):
-                    return True
-                return False
-            return True
-
-        closed_today = []
-        for trade in closed_payload.get("trades", []):
-            if not _is_strategy_trade(trade):
-                continue
-            close_dt = self._parse_oanda_time(trade.get("closeTime"))
-            if close_dt and close_dt.date() == target_date:
-                closed_today.append(trade)
-
-        pnl_total = sum(float(trade.get("realizedPL", 0)) for trade in closed_today)
         start_balance = balance_end - pnl_total
         pnl_percent = (pnl_total / start_balance) * 100 if start_balance else 0.0
-        trade_count = len(closed_today)
+        trade_count = len(closed_trade_ids)
         message = (
             f"EOD PnL for {target_date}: {pnl_total:.2f} ({pnl_percent:.2f}%). "
             f"Closed trades: {trade_count}. Start balance: {start_balance:.2f}. "
@@ -1049,9 +1126,7 @@ class OandaAdvancedTradingBot:
                 try:
                     now = datetime.utcnow()
                     if now.weekday() >= 5:
-                        logging.info("Weekend detected (UTC). Trading paused until Monday.")
-                        self.send_keepalive()
-                        time.sleep(6 * 60 * 60)
+                        self._sleep_until_market_resume(now)
                         continue
                     for symbol in self.symbols:
                         # Allow FX and metals (XAU/XAG). Your params file contains XAUUSD/XAGUSD.
