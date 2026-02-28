@@ -88,8 +88,10 @@ Order placement and prices:
 
 ## 2) Repository Structure
 
-- `mt5_backtest.py` – historical data fetch + indicator calculation + backtest execution and optimization workflow.
-- `oanda_trading_fixed.py` – OANDA live bot (signal generation, order placement, trade/order sync, EOD reporting, Telegram).
+- `backtest/mt5_backtest.py` – historical data fetch + indicator calculation + backtest execution workflow.
+- `backtest/mt5_optimize.py` – optimization runner built on top of the backtest engine.
+- `live_trading/oanda_trading_fixed.py` – OANDA live bot (signal generation, order placement, trade/order sync, EOD reporting, Telegram).
+- `live_trading/oanda_dashboard.py` – dashboard app for monitoring/operations.
 - `backtest_outputs/` – generated optimization artifacts (`symbol_params_latest.json`, result CSV/XLSX files).
 - `requirements.txt` – Python dependencies.
 - `Procfile` – process start command for deployment environments like Heroku.
@@ -114,7 +116,7 @@ pip install -r requirements.txt
 
 ---
 
-## 4) Backtesting Guide (`mt5_backtest.py`)
+## 4) Backtesting Guide (`backtest/mt5_backtest.py`)
 
 ## What it does
 
@@ -129,7 +131,7 @@ pip install -r requirements.txt
 Run with your preferred CLI arguments (see script help):
 
 ```bash
-python mt5_backtest.py --help
+python backtest/mt5_backtest.py --help
 ```
 
 Then run a full optimization/backtest pass and confirm new files in `backtest_outputs/`.
@@ -153,7 +155,7 @@ Before promoting params to live:
 
 ---
 
-## 5) OANDA Live Trading Guide (`oanda_trading_fixed.py`)
+## 5) OANDA Live Trading Guide (`live_trading/oanda_trading_fixed.py`)
 
 ## Environment variables
 
@@ -183,7 +185,7 @@ export TELEGRAM_CHAT_ID="..."
 ## Start live bot
 
 ```bash
-python oanda_trading_fixed.py
+python live_trading/oanda_trading_fixed.py
 ```
 
 At startup, the bot:
